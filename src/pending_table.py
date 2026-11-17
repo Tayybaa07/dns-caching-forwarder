@@ -9,15 +9,16 @@ Responsibilities (C3 / C4 / C7 – Tayyba Bashir):
     the upstream responds:
         • client address (ip, port)
         • original client-supplied DNS query ID
-        • question section (list of dnslib.DNSQuestion objects or (qname, qtype))
+        • question section (list of dnslib.DNSQuestion objects or (name, qtype, qclass))
         • timestamp at which the entry was inserted (monotonic clock)
         • raw client query packet (for retries & SERVFAIL generation)
         • upstream address (ip, port) that query was routed to (for response verification)
         • retried flag (indicates whether 1 backup retry has already been attempted)
+        • qname, qtype, qclass (canonical query attributes)
+        • start_time (initial arrival timestamp for C10 resolution latency calculation)
 
   - Provides atomic insert / lookup / remove operations so that the
-    listener thread and multiple worker threads can share the table
-    safely.
+    listener thread and multiple worker threads can share the table safely.
 
   - Provides a background reaper that expires stale entries whose
     upstream never replied within a configurable timeout (default: 1.0 s).
@@ -61,8 +62,10 @@ logger = logging.getLogger(__name__)
 #   raw_query     : bytes – original query packet for backup retries / SERVFAIL
 #   upstream_addr : tuple – (host, port) of the upstream server queried
 #   retried       : bool  – True if backup upstream retry has been attempted
-#   qname         : str   – domain name queried
-#   qtype         : Any   – query record type (e.g. 'A', 'AAAA', 1, 28)
+#   qname         : str   – domain name queried (lowercased, no trailing dot)
+#   qtype         : Any   – query record type (int or str)
+#   qclass        : int   – query class (e.g. CLASS.IN == 1)
+#   start_time    : float – initial request arrival time for C10 latency metrics
 PendingEntry = namedtuple(
     "PendingEntry",
     [
@@ -76,8 +79,10 @@ PendingEntry = namedtuple(
         "retried",
         "qname",
         "qtype",
+        "qclass",
+        "start_time",
     ],
-    defaults=(b"", ("", 0), False, "", ""),
+    defaults=(b"", ("", 0), False, "", "", 1, 0.0),
 )
 
 
@@ -124,47 +129,31 @@ class PendingTable:
         retried: bool = False,
         qname: str = "",
         qtype: Any = "",
+        qclass: int = 1,
+        start_time: float = 0.0,
     ) -> bool:
         """
         Insert a new pending-query entry.
 
-        Parameters
-        ----------
-        upstream_id : int
-            The randomly generated 16-bit ID assigned to the upstream query.
-        client_addr : tuple
-            ``(ip, port)`` of the DNS client that sent the original query.
-        client_id : int
-            The DNS message ID that the client used in its query.
-        questions : list
-            Question information from the client query.
-        raw_query : bytes
-            Original query datagram for retries and SERVFAIL.
-        upstream_addr : tuple
-            ``(host, port)`` of the upstream server queried.
-        retried : bool
-            Whether this query is already on its backup retry.
-        qname : str
-            Query domain name.
-        qtype : Any
-            Query record type.
-
-        Returns
-        -------
-        bool
-            ``True`` if inserted, ``False`` if ``upstream_id`` collision occurred.
+        Returns True if inserted, False if upstream_id collision occurred.
         """
+        now = time.monotonic()
+        if start_time <= 0.0:
+            start_time = now
+
         entry = PendingEntry(
             upstream_id=upstream_id,
             client_addr=client_addr,
             client_id=client_id,
             questions=questions,
-            timestamp=time.monotonic(),
+            timestamp=now,
             raw_query=raw_query,
             upstream_addr=upstream_addr,
             retried=retried,
             qname=qname,
             qtype=qtype,
+            qclass=qclass,
+            start_time=start_time,
         )
         with self._lock:
             if upstream_id in self._table:
@@ -175,8 +164,7 @@ class PendingTable:
                 return False
             self._table[upstream_id] = entry
             logger.debug(
-                "PendingTable.add: upstream_id=%d  client=%s  client_id=%d  "
-                "upstream=%s  qname=%s",
+                "PendingTable.add: upstream_id=%d client=%s client_id=%d upstream=%s qname=%s",
                 upstream_id,
                 client_addr,
                 client_id,
@@ -186,25 +174,17 @@ class PendingTable:
             return True
 
     def get(self, upstream_id: int) -> Optional[PendingEntry]:
-        """
-        Look up a pending entry by upstream ID without removing it.
-
-        Returns ``None`` if the ID is not in the table.
-        """
+        """Look up a pending entry by upstream ID without removing it."""
         with self._lock:
             return self._table.get(upstream_id)
 
     def remove(self, upstream_id: int) -> Optional[PendingEntry]:
-        """
-        Remove and return the entry for ``upstream_id``.
-
-        Returns ``None`` if the ID was not found (e.g. already expired).
-        """
+        """Remove and return the entry for upstream_id, or None if not found."""
         with self._lock:
             entry = self._table.pop(upstream_id, None)
             if entry:
                 logger.debug(
-                    "PendingTable.remove: upstream_id=%d  client=%s",
+                    "PendingTable.remove: upstream_id=%d client=%s",
                     upstream_id,
                     entry.client_addr,
                 )
@@ -217,7 +197,7 @@ class PendingTable:
     ) -> List[int]:
         """
         Remove and return all upstream IDs whose entries are older than
-        ``max_age_secs`` seconds (measured with monotonic clock).
+        max_age_secs seconds (measured with monotonic clock).
 
         Executes the expiration callback outside the lock to avoid deadlocks.
         """
@@ -236,8 +216,7 @@ class PendingTable:
         cb = callback or self.on_expire
         for entry in expired_entries:
             logger.warning(
-                "PendingTable.expire_old: upstream_id=%d expired "
-                "(client=%s, age=%.2fs)",
+                "PendingTable.expire_old: upstream_id=%d expired (client=%s, age=%.2fs)",
                 entry.upstream_id,
                 entry.client_addr,
                 time.monotonic() - entry.timestamp,
@@ -262,20 +241,14 @@ class PendingTable:
     # ------------------------------------------------------------------
 
     def allocate_id(self, max_attempts: int = 100) -> Optional[int]:
-        """
-        Generate a random 16-bit upstream ID that is not currently in use.
-
-        Tries up to ``max_attempts`` times before giving up (returns ``None``
-        if the table is completely full — extremely unlikely in practice).
-        """
+        """Generate a random 16-bit upstream ID that is not currently in use."""
         for _ in range(max_attempts):
             candidate = random.randint(0, self._MAX_ID)
             with self._lock:
                 if candidate not in self._table:
                     return candidate
         logger.error(
-            "PendingTable.allocate_id: failed to find a free ID after %d "
-            "attempts (table size=%d).",
+            "PendingTable.allocate_id: failed to find free ID after %d attempts (size=%d)",
             max_attempts,
             len(self._table),
         )
@@ -291,18 +264,7 @@ class PendingTable:
         max_age_secs: float = 1.0,
         callback: Optional[Callable[[PendingEntry], None]] = None,
     ) -> None:
-        """
-        Start a daemon thread that periodically sweeps expired entries.
-
-        Parameters
-        ----------
-        interval_secs : float
-            How often (in seconds) the reaper wakes up. Default: 0.2 s.
-        max_age_secs : float
-            Entries older than this are considered timed-out. Default: 1.0 s (C7).
-        callback : Callable, optional
-            Override callback called on each expired entry.
-        """
+        """Start a daemon thread that periodically sweeps expired entries."""
         if self._reaper_thread and self._reaper_thread.is_alive():
             logger.warning("PendingTable.start_reaper: reaper already running.")
             return
@@ -349,84 +311,3 @@ class PendingTable:
 
     def __repr__(self) -> str:
         return f"PendingTable(size={self.size()})"
-
-
-# ---------------------------------------------------------------------------
-# Self-test  (python src/pending_table.py)
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import sys
-
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)-8s] %(name)s – %(message)s",
-        stream=sys.stdout,
-    )
-
-    table = PendingTable()
-    print(f"\n{'='*55}")
-    print("  PendingTable self-test")
-    print(f"{'='*55}\n")
-
-    # 1. Allocate a fresh ID and add an entry
-    uid = table.allocate_id()
-    assert uid is not None, "allocate_id returned None on empty table"
-    added = table.add(
-        upstream_id=uid,
-        client_addr=("127.0.0.1", 12345),
-        client_id=1001,
-        questions=["example.com. IN A"],
-        raw_query=b"fake-query",
-        upstream_addr=("127.0.0.1", 5301),
-        retried=False,
-        qname="example.com.",
-        qtype="A",
-    )
-    assert added, "First add should succeed"
-    print(f"[OK] add()          upstream_id={uid}, table size={table.size()}")
-
-    # 2. Collision guard
-    collision = table.add(uid, ("127.0.0.1", 9999), 2002, [])
-    assert not collision, "Duplicate add should return False"
-    print("[OK] collision guard works (duplicate rejected)")
-
-    # 3. get()
-    entry = table.get(uid)
-    assert entry is not None and entry.client_id == 1001
-    assert entry.raw_query == b"fake-query"
-    assert entry.upstream_addr == ("127.0.0.1", 5301)
-    print(f"[OK] get()          entry={entry}")
-
-    # 4. remove()
-    removed = table.remove(uid)
-    assert removed is not None and table.size() == 0
-    print(f"[OK] remove()       removed={removed}, size after={table.size()}")
-
-    # 5. expire_old() with callback
-    callback_called = []
-    def _test_cb(expired_entry: PendingEntry) -> None:
-        callback_called.append(expired_entry)
-
-    table.on_expire = _test_cb
-    uid2 = table.allocate_id()
-    table.add(uid2, ("10.0.0.1", 53421), 3003, [], raw_query=b"query-2")
-    time.sleep(0.05)
-    expired = table.expire_old(max_age_secs=0.01)   # 10 ms threshold
-    assert uid2 in expired and table.size() == 0
-    assert len(callback_called) == 1
-    assert callback_called[0].upstream_id == uid2
-    print(f"[OK] expire_old()   expired IDs={expired}, callback called={len(callback_called)}")
-
-    # 6. Background reaper smoke-test
-    uid3 = table.allocate_id()
-    table.add(uid3, ("192.168.1.1", 55000), 4004, [])
-    table.start_reaper(interval_secs=0.05, max_age_secs=0.05)
-    time.sleep(0.25)
-    table.stop_reaper()
-    assert table.size() == 0, f"Reaper should have cleared entry, size={table.size()}"
-    print("[OK] background reaper expired the stale entry (default 1.0s support verified)")
-
-    print(f"\n{'='*55}")
-    print("  All tests passed ✓")
-    print(f"{'='*55}\n")

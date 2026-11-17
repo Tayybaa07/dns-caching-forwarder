@@ -3,45 +3,29 @@ listener.py
 ===========
 UDP Listener & Query-ID Rewriter for the DNS Caching Forwarder.
 
-Responsibilities (C1 / C3 / C4 / C6 / C7 – Group 8, Tayyba Bashir):
-  - UDP socket listener on port 5300 (configurable) for client queries.
-  - Worker thread pool for concurrent query handling.
-  - Integration with Zainab's modules:
-      • builder.py  – parse_query, parse_response, hit_reply, notimp, servfail
-      • cache.py    – TTL cache (get / put)
-      • selector.py – UpstreamSelector & HealthProber
-      • probe.py    – make_probe_fn for background recovery probing
-  - Socket Handling (Fix #1):
-      Queries are forwarded to upstream servers using the dedicated upstream
-      socket (_upstream_sock) so replies return to the upstream receive loop.
-  - Cache & Builder Format (Fix #2):
-      builder.parse_query -> cache.get -> on hit: builder.hit_reply -> client
-      On miss: forward upstream -> on reply: builder.parse_response ->
-      cache.put ONLY when rcode == NOERROR.
-  - Packet Validation & Error Responses (Fix #3):
-      Malformed queries dropped immediately without response.
-      Unsupported query types (e.g. MX, TXT) return builder.notimp.
-      Upstream failures / timeouts return builder.servfail.
-  - Upstream Failover & Health Prober (Fix #4):
-      HealthProber thread runs alongside server.
-      Tracks upstream status (report_success / report_timeout).
-      On 1.0s timeout, retries once on backup upstream (selector.other) before
-      returning SERVFAIL (C7).
-  - Response Matching Verification (Fix #5):
-      Verifies Query ID, source IP:port, and question section match pending query.
-      Counts and logs dropped mismatch packets.
+Group 8 – Tayyba Bashir & Zainab Parveen
+Responsibilities:
+  - C1: UDP socket listener on configurable port (default: 5300) with worker pool.
+  - C3: Random 16-bit upstream Query-ID generation & collision check via PendingTable.
+  - C4: Strict response matching (Query-ID, source IP:port, and question section).
+  - C6: Concurrency and thread safety across cache, pending table, and selector.
+  - C7: 1.0 s timeout with single retry on backup upstream before SERVFAIL.
+  - C8/C9: Upstream failover after 3 timeouts and background recovery probing.
+  - C10: Structured query logging and CLI statistics / metrics reporting.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import queue
 import socket
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Any, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -51,295 +35,182 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-# dnslib
-try:
-    import dnslib
-    from dnslib import DNSRecord, DNSHeader, DNSError
-    _HAS_DNSLIB = True
-except ImportError:
-    _HAS_DNSLIB = False
+import dnslib
+from dnslib import QTYPE, RCODE
 
+from builder import (
+    ParsedQuery,
+    hit_reply,
+    notimp,
+    parse_query,
+    parse_response,
+    servfail,
+    set_id,
+)
+from cache import DNSCache
 from pending_table import PendingEntry, PendingTable
+from probe import make_probe_fn
+from selector import DOWN, UP, HealthProber, UpstreamSelector
 
-# ---------------------------------------------------------------------------
-# Module Integrations with Zainab's components & Fallbacks
-# ---------------------------------------------------------------------------
-
-# 1. Builder functions
-try:
-    from builder import (
-        hit_reply as _builder_hit_reply,
-        notimp as _builder_notimp,
-        parse_query as _builder_parse_query,
-        parse_response as _builder_parse_response,
-        servfail as _builder_servfail,
-    )
-except ImportError:
-    def _builder_parse_query(raw: bytes) -> Optional[Tuple[str, str]]:
-        if not _HAS_DNSLIB:
-            if len(raw) < 12:
-                return None
-            return ("unknown.test.", "A")
-        try:
-            d = DNSRecord.parse(raw)
-            if not d.questions:
-                return None
-            q = d.questions[0]
-            qname = str(q.qname).rstrip(".") + "."
-            qtype = dnslib.QTYPE.get(q.qtype, str(q.qtype))
-            return (qname, qtype)
-        except Exception:
-            return None
-
-    def _builder_parse_response(
-        raw: bytes,
-    ) -> Tuple[Optional[int], Optional[int], list, Any]:
-        if not _HAS_DNSLIB:
-            if len(raw) < 12:
-                return (None, None, [], None)
-            rid = int.from_bytes(raw[:2], "big")
-            return (rid, 0, [], None)
-        try:
-            d = DNSRecord.parse(raw)
-            q = d.questions[0] if d.questions else None
-            return (d.header.id, d.header.rcode, d.rr, q)
-        except Exception:
-            return (None, None, [], None)
-
-    def _builder_hit_reply(raw: bytes, rrs: list) -> bytes:
-        if not _HAS_DNSLIB:
-            return raw
-        d = DNSRecord.parse(raw)
-        reply = DNSRecord(
-            DNSHeader(id=d.header.id, qr=1, aa=0, ra=1, rcode=dnslib.RCODE.NOERROR),
-            q=d.q,
-        )
-        for rr in rrs:
-            reply.add_answer(rr)
-        return reply.pack()
-
-    def _builder_notimp(raw: bytes) -> bytes:
-        if not _HAS_DNSLIB:
-            cid = raw[:2] if len(raw) >= 2 else b"\x00\x00"
-            return cid + b"\x81\x84\x00\x00\x00\x00\x00\x00\x00\x00"
-        try:
-            d = DNSRecord.parse(raw)
-            reply = DNSRecord(
-                DNSHeader(id=d.header.id, qr=1, ra=1, rcode=dnslib.RCODE.NOTIMP),
-                q=d.q,
-            )
-            return reply.pack()
-        except Exception:
-            cid = int.from_bytes(raw[:2], "big") if len(raw) >= 2 else 0
-            return DNSRecord(
-                DNSHeader(id=cid, qr=1, ra=1, rcode=dnslib.RCODE.NOTIMP)
-            ).pack()
-
-    def _builder_servfail(raw: bytes) -> bytes:
-        if not _HAS_DNSLIB:
-            cid = raw[:2] if len(raw) >= 2 else b"\x00\x00"
-            return cid + b"\x81\x82\x00\x00\x00\x00\x00\x00\x00\x00"
-        try:
-            d = DNSRecord.parse(raw)
-            reply = DNSRecord(
-                DNSHeader(id=d.header.id, qr=1, ra=1, rcode=dnslib.RCODE.SERVFAIL),
-                q=d.q,
-            )
-            return reply.pack()
-        except Exception:
-            cid = int.from_bytes(raw[:2], "big") if len(raw) >= 2 else 0
-            return DNSRecord(
-                DNSHeader(id=cid, qr=1, ra=1, rcode=dnslib.RCODE.SERVFAIL)
-            ).pack()
-
-
-# 2. TTL Cache
-try:
-    from cache import DNSCache
-except ImportError:
-    class DNSCache:
-        """Fallback in-memory TTL cache."""
-
-        def __init__(self) -> None:
-            self._cache: dict = {}
-            self._lock = threading.Lock()
-
-        def get(self, qname: str, qtype: Any) -> Optional[list]:
-            key = (str(qname).rstrip(".").lower(), str(qtype).upper())
-            with self._lock:
-                item = self._cache.get(key)
-                if not item:
-                    return None
-                expire_at, rrs = item
-                rem = expire_at - time.monotonic()
-                if rem <= 0:
-                    del self._cache[key]
-                    return None
-                for rr in rrs:
-                    if hasattr(rr, "ttl"):
-                        rr.ttl = max(1, int(rem))
-                return rrs
-
-        def put(self, qname: str, qtype: Any, rrs: list) -> None:
-            if not rrs:
-                return
-            min_ttl = min((getattr(rr, "ttl", 0) for rr in rrs), default=0)
-            if min_ttl <= 0:
-                return
-            key = (str(qname).rstrip(".").lower(), str(qtype).upper())
-            with self._lock:
-                self._cache[key] = (time.monotonic() + min_ttl, rrs)
-
-
-# 3. Upstream Selector & Prober
-try:
-    from selector import HealthProber, UpstreamSelector
-except ImportError:
-    class UpstreamSelector:
-        """Fallback upstream selector with 3-timeout failover rule (C8)."""
-
-        def __init__(
-            self,
-            primary: Tuple[str, int] = ("127.0.0.1", 5301),
-            backup: Tuple[str, int] = ("127.0.0.1", 5302),
-        ) -> None:
-            self.primary = primary
-            self.backup = backup
-            self.primary_down = False
-            self.fail_count = 0
-            self._lock = threading.Lock()
-
-        def pick(self) -> Tuple[str, int]:
-            with self._lock:
-                return self.backup if self.primary_down else self.primary
-
-        def other(self, upstream: Tuple[str, int]) -> Tuple[str, int]:
-            with self._lock:
-                return self.backup if upstream == self.primary else self.primary
-
-        def report_success(self, upstream: Tuple[str, int]) -> None:
-            with self._lock:
-                if upstream == self.primary:
-                    self.fail_count = 0
-
-        def report_timeout(self, upstream: Tuple[str, int]) -> None:
-            with self._lock:
-                if upstream == self.primary:
-                    self.fail_count += 1
-                    if self.fail_count >= 3 and not self.primary_down:
-                        self.primary_down = True
-                        logger.warning(
-                            "Primary upstream %s marked DOWN after %d consecutive timeouts. Switching to backup %s (C8).",
-                            self.primary,
-                            self.fail_count,
-                            self.backup,
-                        )
-
-        def mark_up(self, upstream: Tuple[str, int]) -> None:
-            with self._lock:
-                if upstream == self.primary and self.primary_down:
-                    self.primary_down = False
-                    self.fail_count = 0
-                    logger.info(
-                        "Primary upstream %s marked UP after successful recovery probes (C9).",
-                        self.primary,
-                    )
-
-    class HealthProber:
-        """Fallback health prober thread sending probes to DOWN primary every 5s (C9)."""
-
-        def __init__(
-            self, selector: Any, probe_fn: Any = None, interval: float = 5.0
-        ) -> None:
-            self.selector = selector
-            self.probe_fn = probe_fn
-            self.interval = interval
-            self._running = False
-            self._thread: Optional[threading.Thread] = None
-            self.success_count = 0
-
-        def start(self) -> None:
-            self._running = True
-            self._thread = threading.Thread(
-                target=self._run, name="health-prober", daemon=True
-            )
-            self._thread.start()
-
-        def _run(self) -> None:
-            while self._running:
-                time.sleep(self.interval)
-                if not self._running:
-                    break
-                is_down = getattr(self.selector, "primary_down", False)
-                if is_down and self.probe_fn:
-                    ok = False
-                    try:
-                        ok = self.probe_fn()
-                    except Exception:
-                        ok = False
-                    if ok:
-                        self.success_count += 1
-                        logger.info(
-                            "Recovery probe to primary succeeded (%d/2)",
-                            self.success_count,
-                        )
-                        if self.success_count >= 2:
-                            if hasattr(self.selector, "mark_up"):
-                                self.selector.mark_up(self.selector.primary)
-                            self.success_count = 0
-                    else:
-                        self.success_count = 0
-
-        def stop(self) -> None:
-            self._running = False
-            if self._thread:
-                self._thread.join(timeout=2.0)
-                self._thread = None
-
-
-# 4. Probe factory
-try:
-    from probe import make_probe_fn
-except ImportError:
-    def make_probe_fn(
-        target_addr: Tuple[str, int], test_name: str = "probe.test."
-    ) -> Any:
-        def probe() -> bool:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(1.0)
-                if _HAS_DNSLIB:
-                    q = DNSRecord.question(test_name)
-                    data = q.pack()
-                else:
-                    data = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05probe\x04test\x00\x00\x01\x00\x01"
-                sock.sendto(data, target_addr)
-                reply, _ = sock.recvfrom(512)
-                sock.close()
-                return len(reply) >= 12
-            except Exception:
-                return False
-
-        return probe
-
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Helpers for Matching & Normalization (Fix #5 & Fix #3)
+# C10: Structured Query Logger & Metrics Tracking
 # ---------------------------------------------------------------------------
 
-def _is_supported_type(qtype: Any) -> bool:
-    """Supported query types are standard A (1) and AAAA (28), class IN (C1/C2)."""
-    if isinstance(qtype, int):
-        return qtype in (1, 28)
-    q_str = str(qtype).strip().upper()
-    return q_str in ("A", "AAAA")
+class QueryLogger:
+    """
+    Structured query logger (compulsory feature C10).
 
+    Outputs one line per completed query in the exact format:
+      [TIMESTAMP] client=<ip:port> name=<qname> type=<type> result=<HIT|MISS|DROP|ERR> upstream=<ip:port|NONE> latency_ms=<0.0> rcode=<RCODE>
+    """
+
+    def __init__(self, log_file: Optional[str] = None) -> None:
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        if self.log_file:
+            # Touch log file to ensure it is writable
+            with open(self.log_file, "a") as f:
+                pass
+
+    def log(
+        self,
+        client: Tuple[str, int],
+        name: str,
+        qtype: str,
+        result: str,
+        upstream: Optional[Tuple[str, int]],
+        latency_ms: float,
+        rcode: str,
+    ) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        client_str = f"{client[0]}:{client[1]}"
+        up_str = f"{upstream[0]}:{upstream[1]}" if upstream else "NONE"
+        line = (
+            f"[{ts}] client={client_str:<21} name={name:<20} type={qtype:<5} "
+            f"result={result:<4} upstream={up_str:<21} latency_ms={latency_ms:>6.2f} rcode={rcode}"
+        )
+        with self._lock:
+            print(f"QUERY {line}", flush=True)
+            if self.log_file:
+                try:
+                    with open(self.log_file, "a") as f:
+                        f.write(line + "\n")
+                except Exception as exc:
+                    logger.error("Failed to write to query log file: %s", exc)
+
+
+class ForwarderStats:
+    """
+    Thread-safe runtime statistics tracker & CLI view (C10).
+
+    Tracks hits, misses, hit ratio, response-time percentiles, upstream query counts,
+    and active upstream server state.
+    """
+
+    def __init__(self, selector: UpstreamSelector) -> None:
+        self.selector = selector
+        self._lock = threading.Lock()
+        self.total_queries = 0
+        self.hits = 0
+        self.misses = 0
+        self.errors = 0
+        self.mismatch_drops = 0
+        self.latencies: list[float] = []
+        self.upstream_queries: dict[Tuple[str, int], int] = {}
+
+    def record_hit(self, latency_ms: float) -> None:
+        with self._lock:
+            self.total_queries += 1
+            self.hits += 1
+            self.latencies.append(latency_ms)
+
+    def record_miss(self, latency_ms: float) -> None:
+        with self._lock:
+            self.total_queries += 1
+            self.misses += 1
+            self.latencies.append(latency_ms)
+
+    def record_unsupported(self, latency_ms: float) -> None:
+        with self._lock:
+            self.total_queries += 1
+            self.errors += 1
+            self.latencies.append(latency_ms)
+
+    def record_error(self, latency_ms: float) -> None:
+        with self._lock:
+            self.total_queries += 1
+            self.errors += 1
+            self.latencies.append(latency_ms)
+
+    def record_drop(self) -> None:
+        with self._lock:
+            self.mismatch_drops += 1
+
+    def record_mismatch(self) -> None:
+        with self._lock:
+            self.mismatch_drops += 1
+
+    def record_upstream_query(self, upstream: Tuple[str, int]) -> None:
+        with self._lock:
+            self.upstream_queries[upstream] = self.upstream_queries.get(upstream, 0) + 1
+
+    def get_summary(self) -> str:
+        with self._lock:
+            total = self.total_queries
+            hits = self.hits
+            misses = self.misses
+            errors = self.errors
+            drops = self.mismatch_drops
+            hit_ratio = (hits / total * 100.0) if total > 0 else 0.0
+            lats = sorted(self.latencies)
+            up_counts = dict(self.upstream_queries)
+
+        if lats:
+            min_lat = lats[0]
+            max_lat = lats[-1]
+            mean_lat = sum(lats) / len(lats)
+            p95_idx = int(math.ceil(0.95 * len(lats))) - 1
+            p95_lat = lats[max(0, p95_idx)]
+        else:
+            min_lat = max_lat = mean_lat = p95_lat = 0.0
+
+        p_state = self.selector.state(self.selector.primary)
+        b_state = self.selector.state(self.selector.backup)
+        cur = self.selector.current()
+
+        lines = [
+            "",
+            "=" * 64,
+            "                 DNS FORWARDER STATISTICS (C10)",
+            "=" * 64,
+            f" Total Queries:          {total}",
+            f" Cache Hits:             {hits} ({hit_ratio:.1f}%)",
+            f" Cache Misses:           {misses} ({100.0 - hit_ratio if total else 0.0:.1f}%)",
+            f" Errors / Unsupported:   {errors}",
+            f" Mismatched / Dropped:   {drops}",
+            "-" * 64,
+            " Resolution Latency (ms):",
+            f"   Min:                  {min_lat:.2f} ms",
+            f"   Mean:                 {mean_lat:.2f} ms",
+            f"   95th Percentile:      {p95_lat:.2f} ms",
+            f"   Max:                  {max_lat:.2f} ms",
+            "-" * 64,
+            " Upstream Server Query Counts:",
+            f"   Primary {self.selector.primary[0]}:{self.selector.primary[1]} ({p_state:4s}):  {up_counts.get(self.selector.primary, 0)}",
+            f"   Backup  {self.selector.backup[0]}:{self.selector.backup[1]} ({b_state:4s}):  {up_counts.get(self.selector.backup, 0)}",
+            f" Active Upstream:        {cur[0]}:{cur[1]}",
+            "=" * 64,
+            "",
+        ]
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Matching (Fix #5 / C4)
+# ---------------------------------------------------------------------------
 
 def _match_addr(addr1: Tuple[str, int], addr2: Tuple[str, int]) -> bool:
     """Verify source address and port match expected upstream address."""
@@ -357,52 +228,6 @@ def _match_addr(addr1: Tuple[str, int], addr2: Tuple[str, int]) -> bool:
         return False
 
 
-def _match_question(reply_question: Any, exp_qname: str, exp_qtype: Any) -> bool:
-    """Verify reply question matches the pending query's question."""
-    if reply_question is None:
-        return True
-
-    rqname = None
-    rqtype = None
-
-    if isinstance(reply_question, tuple) and len(reply_question) >= 2:
-        rqname, rqtype = reply_question[0], reply_question[1]
-    elif hasattr(reply_question, "qname") and hasattr(reply_question, "qtype"):
-        rqname = reply_question.qname
-        rqtype = reply_question.qtype
-    elif isinstance(reply_question, (list, tuple)) and len(reply_question) > 0:
-        first = reply_question[0]
-        if hasattr(first, "qname") and hasattr(first, "qtype"):
-            rqname = first.qname
-            rqtype = first.qtype
-
-    if rqname is not None:
-        norm_r = str(rqname).strip().rstrip(".").lower()
-        norm_exp = str(exp_qname).strip().rstrip(".").lower()
-        if norm_r != norm_exp:
-            return False
-
-    if rqtype is not None:
-        if _HAS_DNSLIB and hasattr(dnslib, "QTYPE"):
-            r_str = (
-                dnslib.QTYPE.get(rqtype, str(rqtype))
-                if isinstance(rqtype, int)
-                else str(rqtype)
-            )
-            exp_str = (
-                dnslib.QTYPE.get(exp_qtype, str(exp_qtype))
-                if isinstance(exp_qtype, int)
-                else str(exp_qtype)
-            )
-        else:
-            r_str = str(rqtype)
-            exp_str = str(exp_qtype)
-        if r_str.upper() != exp_str.upper():
-            return False
-
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Worker: processes one datagram from the queue
 # ---------------------------------------------------------------------------
@@ -411,109 +236,154 @@ def _process_query(
     raw: bytes,
     client_addr: Tuple[str, int],
     pending: PendingTable,
-    cache: Any,
-    upstream_selector: Any,
+    cache: DNSCache,
+    upstream_selector: UpstreamSelector,
     client_sock: socket.socket,
     upstream_sock: socket.socket,
+    stats: Optional[ForwarderStats] = None,
+    query_logger: Optional[QueryLogger] = None,
 ) -> None:
     """
     Handle a single client DNS query in a worker thread.
 
-    Steps
-    -----
-    1. Parse query using builder.parse_query.
-       If None (malformed), drop packet immediately without response (Fix #3).
-    2. Check supported query type (A/AAAA). If unsupported, return builder.notimp (Fix #3).
-    3. Check cache using cache.get(qname, qtype).
-       On hit: build reply using builder.hit_reply and send via client_sock (Fix #2).
-    4. On miss: allocate upstream ID, record in PendingTable, rewrite query ID,
-       and forward upstream using upstream_sock (Fix #1).
+    Steps:
+      1. Parse query with builder.parse_query -> ParsedQuery dataclass.
+         If None (malformed), drop packet immediately without response.
+      2. Check parsed.supported (A/AAAA class IN). If unsupported, return notimp.
+      3. Cache check: cache.get(qname, qtype, qclass).
+         On hit: return hit_reply directly to client.
+      4. Cache miss: allocate upstream ID, record in PendingTable, rewrite ID,
+         and forward upstream via upstream_sock (Fix #1).
     """
-    # 1. Parse query
-    parsed = _builder_parse_query(raw)
+    arrival_time = time.monotonic()
+
+    # 1. Parse query (Zainab's ParsedQuery dataclass)
+    parsed = parse_query(raw)
     if parsed is None:
-        logger.warning(
-            "Malformed DNS query received from %s – dropped without response.",
-            client_addr,
-        )
+        if stats:
+            stats.record_drop()
+        if query_logger:
+            query_logger.log(
+                client=client_addr,
+                name="<malformed>",
+                qtype="<none>",
+                result="DROP",
+                upstream=None,
+                latency_ms=(time.monotonic() - arrival_time) * 1000.0,
+                rcode="MALFORMED",
+            )
+        logger.warning("Malformed DNS query from %s – dropped without response.", client_addr)
         return
 
-    qname, qtype = parsed
-    logger.debug("Received query for %s %s from %s", qname, qtype, client_addr)
+    qname = parsed.name      # lowercased, no trailing dot (e.g. 'www.lab.test')
+    qtype = parsed.qtype     # int (e.g. QTYPE.A == 1)
+    qclass = parsed.qclass   # int (e.g. CLASS.IN == 1)
+    qtype_name = QTYPE.get(qtype, str(qtype))
 
-    # 2. Check query type support (C2)
-    if not _is_supported_type(qtype):
-        logger.info(
-            "Unsupported query type %s for %s from %s – returning NOTIMP (C2)",
-            qtype,
-            qname,
-            client_addr,
-        )
-        notimp_reply = _builder_notimp(raw)
-        client_sock.sendto(notimp_reply, client_addr)
+    # 2. Check query type support (C1/C2: standard A/AAAA, class IN)
+    if not parsed.supported:
+        reply_bytes = notimp(raw)
+        client_sock.sendto(reply_bytes, client_addr)
+        latency_ms = (time.monotonic() - arrival_time) * 1000.0
+        if stats:
+            stats.record_unsupported(latency_ms)
+        if query_logger:
+            query_logger.log(
+                client=client_addr,
+                name=qname,
+                qtype=qtype_name,
+                result="ERR",
+                upstream=None,
+                latency_ms=latency_ms,
+                rcode="NOTIMP",
+            )
+        logger.info("Unsupported query type %s (%s) from %s – returned NOTIMP", qtype_name, qname, client_addr)
         return
 
     # 3. Cache lookup (C5)
-    rrs = cache.get(qname, qtype)
+    rrs = cache.get(qname, qtype, qclass)
     if rrs is not None:
-        hit_reply = _builder_hit_reply(raw, rrs)
-        client_sock.sendto(hit_reply, client_addr)
-        logger.info("Cache HIT for %s %s → replied to %s", qname, qtype, client_addr)
+        reply_bytes = hit_reply(raw, rrs)
+        client_sock.sendto(reply_bytes, client_addr)
+        latency_ms = (time.monotonic() - arrival_time) * 1000.0
+        if stats:
+            stats.record_hit(latency_ms)
+        if query_logger:
+            query_logger.log(
+                client=client_addr,
+                name=qname,
+                qtype=qtype_name,
+                result="HIT",
+                upstream=None,
+                latency_ms=latency_ms,
+                rcode="NOERROR",
+            )
+        logger.info("Cache HIT for %s %s → replied to %s (%.2f ms)", qname, qtype_name, client_addr, latency_ms)
         return
 
     # 4. Cache MISS – forward to selected upstream (Fix #1)
-    up_host, up_port = upstream_selector.pick()
-    upstream_addr = (up_host, up_port)
+    upstream_addr = upstream_selector.pick()
 
     upstream_id = pending.allocate_id()
     if upstream_id is None:
-        logger.error(
-            "Failed to allocate upstream ID for query from %s (table full) – sending SERVFAIL",
-            client_addr,
-        )
-        servfail_reply = _builder_servfail(raw)
-        client_sock.sendto(servfail_reply, client_addr)
+        reply_bytes = servfail(raw)
+        client_sock.sendto(reply_bytes, client_addr)
+        latency_ms = (time.monotonic() - arrival_time) * 1000.0
+        if stats:
+            stats.record_error(latency_ms)
+        if query_logger:
+            query_logger.log(
+                client=client_addr,
+                name=qname,
+                qtype=qtype_name,
+                result="ERR",
+                upstream=upstream_addr,
+                latency_ms=latency_ms,
+                rcode="SERVFAIL",
+            )
+        logger.error("Failed to allocate upstream ID for query from %s – sent SERVFAIL", client_addr)
         return
 
-    client_id = int.from_bytes(raw[:2], "big")
+    client_id = parsed.id
 
     added = pending.add(
         upstream_id=upstream_id,
         client_addr=client_addr,
         client_id=client_id,
-        questions=[(qname, qtype)],
+        questions=[(qname, qtype, qclass)],
         raw_query=raw,
         upstream_addr=upstream_addr,
         retried=False,
-        qname=str(qname),
+        qname=qname,
         qtype=qtype,
+        qclass=qclass,
+        start_time=arrival_time,
     )
     if not added:
-        logger.warning(
-            "PendingTable collision for upstream_id=%d – dropping query from %s",
-            upstream_id,
-            client_addr,
-        )
+        logger.warning("PendingTable collision for upstream_id=%d – dropping", upstream_id)
         return
 
-    rewritten = upstream_id.to_bytes(2, "big") + raw[2:]
+    rewritten = set_id(raw, upstream_id)
+
+    if stats:
+        stats.record_upstream_query(upstream_addr)
 
     try:
-        # Use upstream_sock so responses arrive on the dedicated upstream listener (Fix #1)
+        # Use upstream_sock so responses arrive on dedicated upstream listener (Fix #1)
         upstream_sock.sendto(rewritten, upstream_addr)
         logger.info(
-            "Cache MISS for %s %s (upstream_id=%d) → forwarded to %s:%d via upstream socket",
+            "Cache MISS for %s %s (upstream_id=%d) → forwarded to %s:%d",
             qname,
-            qtype,
+            qtype_name,
             upstream_id,
-            up_host,
-            up_port,
+            upstream_addr[0],
+            upstream_addr[1],
         )
     except Exception as exc:
-        logger.error("Failed to forward query to upstream %s:%d: %s", up_host, up_port, exc)
+        logger.error("Failed to forward query to upstream %s: %s", upstream_addr, exc)
         pending.remove(upstream_id)
-        servfail_reply = _builder_servfail(raw)
-        client_sock.sendto(servfail_reply, client_addr)
+        reply_bytes = servfail(raw)
+        client_sock.sendto(reply_bytes, client_addr)
 
 
 # ---------------------------------------------------------------------------
@@ -524,35 +394,32 @@ def _handle_upstream_reply(
     raw: bytes,
     upstream_addr: Tuple[str, int],
     pending: PendingTable,
-    cache: Any,
+    cache: DNSCache,
     client_sock: socket.socket,
-    upstream_selector: Any,
-    forwarder: Optional["DNSForwarder"] = None,
+    upstream_selector: UpstreamSelector,
+    stats: Optional[ForwarderStats] = None,
+    query_logger: Optional[QueryLogger] = None,
 ) -> None:
     """
-    Process a reply datagram received from an upstream DNS server.
+    Process reply datagram received from an upstream DNS server.
 
-    Verification steps (Fix #5 / C4):
+    Strict verification (C4 / Fix #5):
       1. Check packet length (>= 12 bytes).
       2. Match upstream Query ID to a pending query.
       3. Verify source IP:port matches expected upstream.
-      4. Verify question section matches pending query.
-      If any check fails, drop packet and increment mismatch counter.
+      4. Verify question section matches pending query's (name, qtype, qclass).
+      If any check fails, drop packet and increment mismatch drop counter.
 
-    Delivery steps (Fix #2):
+    Delivery (C5 / Fix #2):
       5. Report success to upstream selector.
-      6. Parse with builder.parse_response; cache ONLY when rcode == NOERROR.
-      7. Restore original client ID and send response to client.
+      6. Cache ONLY when rcode == NOERROR (with answer records).
+      7. Restore original client ID and send reply to client.
+      8. Record C10 latency metrics and structured query log.
     """
     if len(raw) < 12:
-        if forwarder:
-            forwarder.mismatch_count += 1
-        logger.warning(
-            "Dropped upstream reply: packet too short (%d bytes) from %s (total mismatches: %d)",
-            len(raw),
-            upstream_addr,
-            forwarder.mismatch_count if forwarder else 1,
-        )
+        if stats:
+            stats.record_mismatch()
+        logger.warning("Dropped upstream reply: packet too short (%d bytes) from %s", len(raw), upstream_addr)
         return
 
     upstream_id = int.from_bytes(raw[:2], "big")
@@ -560,53 +427,42 @@ def _handle_upstream_reply(
 
     # 1. Match Query ID
     if entry is None:
-        if forwarder:
-            forwarder.mismatch_count += 1
-        logger.warning(
-            "Reply mismatch: unknown or expired upstream_id=%d from %s (total mismatches: %d) – dropped",
-            upstream_id,
-            upstream_addr,
-            forwarder.mismatch_count if forwarder else 1,
-        )
+        if stats:
+            stats.record_mismatch()
+        logger.warning("Reply mismatch: unknown or expired upstream_id=%d from %s – dropped", upstream_id, upstream_addr)
         return
 
     # 2. Verify source IP and port
     if not _match_addr(upstream_addr, entry.upstream_addr):
-        if forwarder:
-            forwarder.mismatch_count += 1
+        if stats:
+            stats.record_mismatch()
         logger.warning(
-            "Reply mismatch: source address %s does not match expected upstream %s for upstream_id=%d (total mismatches: %d) – dropped",
+            "Reply mismatch: source address %s does not match expected upstream %s for upstream_id=%d – dropped",
             upstream_addr,
             entry.upstream_addr,
             upstream_id,
-            forwarder.mismatch_count if forwarder else 1,
         )
         return
 
-    # 3. Parse response and verify question section
-    try:
-        resp_id, rcode, rrs, reply_question = _builder_parse_response(raw)
-    except Exception as exc:
-        if forwarder:
-            forwarder.mismatch_count += 1
-        logger.warning(
-            "Reply mismatch: failed to parse upstream response for upstream_id=%d: %s (total mismatches: %d) – dropped",
-            upstream_id,
-            exc,
-            forwarder.mismatch_count if forwarder else 1,
-        )
+    # 3. Parse response and verify question section (Fix #5)
+    parsed_resp = parse_response(raw)
+    if parsed_resp is None:
+        if stats:
+            stats.record_mismatch()
+        logger.warning("Reply mismatch: failed to parse upstream response for upstream_id=%d – dropped", upstream_id)
         return
 
-    if not _match_question(reply_question, entry.qname, entry.qtype):
-        if forwarder:
-            forwarder.mismatch_count += 1
+    resp_id, rcode, rrs, question_key = parsed_resp
+    # In builder.py, question_key is (str(q.qname).lower().rstrip('.'), q.qtype, q.qclass)
+    expected_key = (entry.qname, entry.qtype, entry.qclass)
+    if question_key != expected_key:
+        if stats:
+            stats.record_mismatch()
         logger.warning(
-            "Reply mismatch: question %s does not match expected (%s, %s) for upstream_id=%d (total mismatches: %d) – dropped",
-            reply_question,
-            entry.qname,
-            entry.qtype,
+            "Reply mismatch: question %s does not match expected %s for upstream_id=%d – dropped",
+            question_key,
+            expected_key,
             upstream_id,
-            forwarder.mismatch_count if forwarder else 1,
         )
         return
 
@@ -614,45 +470,46 @@ def _handle_upstream_reply(
     pending.remove(upstream_id)
 
     # Report success to upstream selector (Fix #4)
-    if hasattr(upstream_selector, "report_success"):
-        upstream_selector.report_success(entry.upstream_addr)
+    upstream_selector.report_success(entry.upstream_addr)
 
     # Cache only when rcode == NOERROR (Fix #2 / C5)
-    is_noerror = rcode == 0 or (
-        _HAS_DNSLIB and hasattr(dnslib, "RCODE") and rcode == dnslib.RCODE.NOERROR
-    )
-    if is_noerror and rrs:
-        try:
-            cache.put(entry.qname, entry.qtype, rrs)
-            logger.debug(
-                "Cached NOERROR response for %s %s (%d RRs)",
-                entry.qname,
-                entry.qtype,
-                len(rrs),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to cache response for %s %s: %s",
-                entry.qname,
-                entry.qtype,
-                exc,
-            )
+    if rcode == RCODE.NOERROR and rrs:
+        cache.put(entry.qname, entry.qtype, rrs, entry.qclass)
+        logger.debug("Cached NOERROR response for %s %s (%d RRs)", entry.qname, entry.qtype, len(rrs))
 
     # Restore original client ID and send reply to client
-    client_response = entry.client_id.to_bytes(2, "big") + raw[2:]
+    client_response = set_id(raw, entry.client_id)
     try:
         client_sock.sendto(client_response, entry.client_addr)
-        logger.info(
-            "Forwarded upstream reply to %s | client_id=%d | upstream_id=%d | rcode=%s",
-            entry.client_addr,
-            entry.client_id,
-            upstream_id,
-            rcode,
-        )
     except Exception as exc:
-        logger.error(
-            "Failed to send reply to client %s: %s", entry.client_addr, exc
+        logger.error("Failed to send reply to client %s: %s", entry.client_addr, exc)
+
+    latency_ms = (time.monotonic() - entry.start_time) * 1000.0
+    rcode_name = RCODE.get(rcode, str(rcode))
+    qtype_name = QTYPE.get(entry.qtype, str(entry.qtype))
+
+    if stats:
+        stats.record_miss(latency_ms)
+
+    if query_logger:
+        query_logger.log(
+            client=entry.client_addr,
+            name=entry.qname,
+            qtype=qtype_name,
+            result="MISS",
+            upstream=entry.upstream_addr,
+            latency_ms=latency_ms,
+            rcode=rcode_name,
         )
+
+    logger.info(
+        "Forwarded upstream reply to %s | client_id=%d | upstream_id=%d | rcode=%s | latency=%.2f ms",
+        entry.client_addr,
+        entry.client_id,
+        upstream_id,
+        rcode_name,
+        latency_ms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +533,9 @@ class DNSForwarder:
         num_workers: int = 4,
         pending_timeout: float = 1.0,
         reaper_interval: float = 0.2,
+        cache_enabled: bool = True,
+        log_file: Optional[str] = None,
+        stats_interval: float = 0.0,
     ) -> None:
         self.listen_port = listen_port
         self.primary_host = primary_host
@@ -685,41 +545,32 @@ class DNSForwarder:
         self.num_workers = num_workers
         self.pending_timeout = pending_timeout
         self.reaper_interval = reaper_interval
-
-        self.mismatch_count = 0
+        self.stats_interval = stats_interval
 
         # Pending-query table with timeout callback (C3 / C4 / C7)
         self._pending = PendingTable(on_expire=self._handle_pending_timeout)
 
-        # TTL cache (C5)
-        self._cache = DNSCache()
+        # TTL cache (C5) — toggleable for baseline B2
+        self._cache = DNSCache(enabled=cache_enabled)
 
         # Upstream selector (C8)
-        primary_addr = (self.primary_host, self.primary_port)
-        backup_addr = (self.backup_host, self.backup_port)
-        try:
-            self._upstream_selector = UpstreamSelector(
-                primary=primary_addr, backup=backup_addr
-            )
-        except TypeError:
-            try:
-                self._upstream_selector = UpstreamSelector()
-            except Exception:
-                self._upstream_selector = UpstreamSelector(
-                    primary=primary_addr, backup=backup_addr
-                )
+        self.primary_addr = (self.primary_host, self.primary_port)
+        self.backup_addr = (self.backup_host, self.backup_port)
+        self._upstream_selector = UpstreamSelector(
+            primary=self.primary_addr,
+            backup=self.backup_addr,
+            fail_threshold=3,
+            probe_interval=5.0,
+            probe_successes=2,
+        )
 
-        # Health prober (C9)
-        try:
-            probe_fn = make_probe_fn(primary_addr)
-            self._health_prober = HealthProber(
-                self._upstream_selector, probe_fn=probe_fn
-            )
-        except Exception:
-            try:
-                self._health_prober = HealthProber(self._upstream_selector)
-            except Exception:
-                self._health_prober = None
+        # Health prober (C9 / Fix #4)
+        send_probe_fn = make_probe_fn("probe.lab.test", timeout=1.0)
+        self._health_prober = HealthProber(self._upstream_selector, send_probe_fn, tick=0.25)
+
+        # C10: Structured Logger & Statistics Tracker
+        self.stats = ForwarderStats(self._upstream_selector)
+        self.query_logger = QueryLogger(log_file=log_file)
 
         # Work queue: (raw_bytes, client_addr)
         self._query_queue: queue.Queue[Tuple[bytes, Tuple[str, int]]] = queue.Queue()
@@ -730,6 +581,7 @@ class DNSForwarder:
         self._running = False
         self._worker_threads: list[threading.Thread] = []
         self._upstream_listener_thread: Optional[threading.Thread] = None
+        self._stats_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Timeout & Failover handler (Fix #4 / C7)
@@ -752,35 +604,24 @@ class DNSForwarder:
             entry.retried,
         )
 
-        if hasattr(self._upstream_selector, "report_timeout"):
-            self._upstream_selector.report_timeout(upstream_addr)
+        self._upstream_selector.report_timeout(upstream_addr)
 
         if not entry.retried:
-            # Attempt other upstream exactly once (C7)
-            if hasattr(self._upstream_selector, "other"):
-                other_upstream = self._upstream_selector.other(upstream_addr)
-            else:
-                other_upstream = upstream_addr
-
+            other_upstream = self._upstream_selector.other(upstream_addr)
             logger.info(
-                "Retrying query for client %s (%s %s) on backup upstream %s (C7)",
+                "Retrying query for client %s (%s) on backup upstream %s (C7)",
                 entry.client_addr,
                 entry.qname,
-                entry.qtype,
                 other_upstream,
             )
 
             new_uid = self._pending.allocate_id()
             if new_uid is None:
-                logger.error(
-                    "Failed to allocate new ID for retry to %s – sending SERVFAIL",
-                    entry.client_addr,
-                )
-                servfail_reply = _builder_servfail(entry.raw_query)
-                self._client_sock.sendto(servfail_reply, entry.client_addr)
+                reply_bytes = servfail(entry.raw_query)
+                self._client_sock.sendto(reply_bytes, entry.client_addr)
                 return
 
-            rewritten = new_uid.to_bytes(2, "big") + entry.raw_query[2:]
+            rewritten = set_id(entry.raw_query, new_uid)
             added = self._pending.add(
                 upstream_id=new_uid,
                 client_addr=entry.client_addr,
@@ -791,46 +632,51 @@ class DNSForwarder:
                 retried=True,
                 qname=entry.qname,
                 qtype=entry.qtype,
+                qclass=entry.qclass,
+                start_time=entry.start_time,
             )
             if not added:
-                logger.warning(
-                    "Collision adding retry entry upstream_id=%d – sending SERVFAIL",
-                    new_uid,
-                )
-                servfail_reply = _builder_servfail(entry.raw_query)
-                self._client_sock.sendto(servfail_reply, entry.client_addr)
+                reply_bytes = servfail(entry.raw_query)
+                self._client_sock.sendto(reply_bytes, entry.client_addr)
                 return
+
+            self.stats.record_upstream_query(other_upstream)
 
             try:
                 self._upstream_sock.sendto(rewritten, other_upstream)
-                logger.info(
-                    "Sent retry query upstream_id=%d to backup upstream %s",
-                    new_uid,
-                    other_upstream,
-                )
+                logger.info("Sent retry query upstream_id=%d to backup upstream %s", new_uid, other_upstream)
             except Exception as exc:
-                logger.error(
-                    "Failed to send retry packet to %s: %s", other_upstream, exc
-                )
+                logger.error("Failed to send retry packet to %s: %s", other_upstream, exc)
                 self._pending.remove(new_uid)
-                servfail_reply = _builder_servfail(entry.raw_query)
-                self._client_sock.sendto(servfail_reply, entry.client_addr)
+                reply_bytes = servfail(entry.raw_query)
+                self._client_sock.sendto(reply_bytes, entry.client_addr)
         else:
             # Both primary and backup upstreams have timed out (C7)
+            latency_ms = (time.monotonic() - entry.start_time) * 1000.0
+            qtype_name = QTYPE.get(entry.qtype, str(entry.qtype))
             logger.error(
                 "Both upstreams timed out for client %s (%s %s) – sending SERVFAIL",
                 entry.client_addr,
                 entry.qname,
-                entry.qtype,
+                qtype_name,
             )
-            servfail_reply = _builder_servfail(entry.raw_query)
+            reply_bytes = servfail(entry.raw_query)
             try:
-                self._client_sock.sendto(servfail_reply, entry.client_addr)
+                self._client_sock.sendto(reply_bytes, entry.client_addr)
             except Exception as exc:
-                logger.error(
-                    "Failed to send SERVFAIL to client %s: %s",
-                    entry.client_addr,
-                    exc,
+                logger.error("Failed to send SERVFAIL to client %s: %s", entry.client_addr, exc)
+
+            self.stats.record_error(latency_ms)
+
+            if self.query_logger:
+                self.query_logger.log(
+                    client=entry.client_addr,
+                    name=entry.qname,
+                    qtype=qtype_name,
+                    result="ERR",
+                    upstream=entry.upstream_addr,
+                    latency_ms=latency_ms,
+                    rcode="SERVFAIL",
                 )
 
     # ------------------------------------------------------------------
@@ -869,14 +715,9 @@ class DNSForwarder:
             max_age_secs=self.pending_timeout,
         )
 
-        # Start health prober thread (Fix #4 / C9)
-        if self._health_prober and hasattr(self._health_prober, "start"):
-            self._health_prober.start()
-            logger.info(
-                "HealthProber started for primary upstream %s:%d",
-                self.primary_host,
-                self.primary_port,
-            )
+        # Start health prober thread (C9 / Fix #4)
+        self._health_prober.start()
+        logger.info("HealthProber started for primary upstream %s:%d", self.primary_host, self.primary_port)
 
         # Start worker pool
         for i in range(self.num_workers):
@@ -897,15 +738,28 @@ class DNSForwarder:
         )
         self._upstream_listener_thread.start()
 
+        # Optional periodic statistics logger (C10)
+        if self.stats_interval > 0:
+            def _stats_loop() -> None:
+                while self._running:
+                    time.sleep(self.stats_interval)
+                    if self._running:
+                        print(self.stats.get_summary(), flush=True)
+
+            self._stats_thread = threading.Thread(
+                target=_stats_loop, name="stats-reporter", daemon=True
+            )
+            self._stats_thread.start()
+
         # Run client receive loop (blocking)
         self._client_receive_loop()
 
     def stop(self) -> None:
-        """Signal all threads to stop and cleanly release resources."""
+        """Signal all threads to stop and print final CLI statistics summary."""
         logger.info("Stopping DNS forwarder…")
         self._running = False
 
-        if self._health_prober and hasattr(self._health_prober, "stop"):
+        if self._health_prober:
             self._health_prober.stop()
             logger.info("HealthProber stopped.")
 
@@ -926,6 +780,9 @@ class DNSForwarder:
             self._upstream_sock.close()
 
         logger.info("DNS forwarder stopped.")
+
+        # Always print final CLI statistics summary upon shutdown (C10)
+        print(self.stats.get_summary(), flush=True)
 
     # ------------------------------------------------------------------
     # Internal loops
@@ -972,7 +829,8 @@ class DNSForwarder:
                 cache=self._cache,
                 client_sock=self._client_sock,
                 upstream_selector=self._upstream_selector,
-                forwarder=self,
+                stats=self.stats,
+                query_logger=self.query_logger,
             )
 
         logger.info("Upstream receive loop exited.")
@@ -1001,6 +859,8 @@ class DNSForwarder:
                     upstream_selector=self._upstream_selector,
                     client_sock=self._client_sock,
                     upstream_sock=self._upstream_sock,
+                    stats=self.stats,
+                    query_logger=self.query_logger,
                 )
             except Exception as exc:
                 logger.exception(
@@ -1029,7 +889,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=5300,
         metavar="PORT",
-        help="UDP port to listen on for client queries",
+        help="UDP port to listen on for client queries (default: 5300)",
     )
     p.add_argument(
         "--primary",
@@ -1047,7 +907,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--upstream",
         default=None,
         metavar="HOST:PORT",
-        help="Override primary upstream server address",
+        help="Alias to override primary upstream server address",
     )
     p.add_argument(
         "--workers",
@@ -1069,6 +929,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0.2,
         metavar="SECS",
         help="How often the reaper sweeps for timed-out queries (default: 0.2)",
+    )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable caching for Baseline B2 evaluation",
+    )
+    p.add_argument(
+        "--stats-interval",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help="Interval in seconds to print live statistics summary (default: 0 = disabled)",
+    )
+    p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Optional file path to write structured query logs to",
     )
     p.add_argument(
         "--log-level",
@@ -1119,15 +997,19 @@ def main(argv: list[str] | None = None) -> None:
         num_workers=args.workers,
         pending_timeout=args.timeout,
         reaper_interval=args.reaper_interval,
+        cache_enabled=not args.no_cache,
+        log_file=args.log_file,
+        stats_interval=args.stats_interval,
     )
 
     logger.info(
-        "Starting DNS Caching Forwarder on port %d | Primary: %s:%d | Backup: %s:%d",
+        "Starting DNS Caching Forwarder on port %d | Primary: %s:%d | Backup: %s:%d | Cache: %s",
         args.port,
         primary_host,
         primary_port,
         backup_host,
         backup_port,
+        "Disabled (B2)" if args.no_cache else "Enabled",
     )
 
     try:

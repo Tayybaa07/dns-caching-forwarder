@@ -1,0 +1,4 @@
+config,queries,hit_ratio,mean_ms,median_ms,p95_ms,hit_mean_ms,miss_mean_ms,upstream_per_run,wrong
+B1_direct,1000,,22.563,21.989,23.809,,,100.0,0
+B2_nocache,1000,0.0,23.256,23.244,23.721,,23.256,100.0,0
+FULL_cache,1000,0.8,7.146,2.857,23.682,2.915,24.07,20.0,0

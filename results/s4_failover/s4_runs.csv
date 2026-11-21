@@ -1,0 +1,6 @@
+run,total_queries,detection_time_s,failover_time_s,recovery_time_s,failed_queries
+1,36,3.35,1.074,9.683,0
+2,35,3.319,1.014,8.891,0
+3,35,3.397,1.1,8.895,0
+4,35,3.399,1.099,8.906,0
+5,35,3.384,1.091,8.886,0

@@ -1,0 +1,5 @@
+metric,mean,median,p95,min,max
+detection_time_s,3.37,3.384,3.399,3.319,3.399
+failover_time_s,1.076,1.091,1.1,1.014,1.1
+recovery_time_s,9.052,8.895,9.683,8.886,9.683
+failed_queries,0.0,0,0,0,0

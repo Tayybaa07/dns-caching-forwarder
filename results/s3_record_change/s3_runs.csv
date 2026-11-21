@@ -1,0 +1,6 @@
+run,ttl,first_new_s,delay_after_change_s,old_answers,new_answers,stale_after_ttl,upstream_queries,pass
+1,10,10.08,8.03,100,1,0,2,True
+2,10,10.078,8.033,100,1,0,2,True
+3,10,10.004,7.956,99,1,0,2,True
+4,10,10.019,7.959,99,1,0,2,True
+5,10,10.098,8.041,100,1,0,2,True

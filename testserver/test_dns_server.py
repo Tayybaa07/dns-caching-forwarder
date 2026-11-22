@@ -7,9 +7,11 @@ forwarder exactly like an unreachable upstream (timeouts).
 
     python testserver/test_dns_server.py --port 5301 --records testserver/records_primary.json
     python testserver/ctl.py 6301 delay 100
+    python testserver/ctl.py 6301 loss 5      # drop 5% of queries
 """
 import argparse
 import json
+import random
 import socket
 import socketserver
 import threading
@@ -24,6 +26,7 @@ class State:
         self.lock = threading.Lock()
         self.records = {}
         self.delay_ms = delay_ms
+        self.loss_pct = 0.0
         self.enabled = True
         self.queries = 0
         if records_file:
@@ -71,9 +74,12 @@ def serve_udp(state, port, host):
 
     def handle(data, addr):
         with state.lock:
-            enabled, delay = state.enabled, state.delay_ms
+            enabled, delay, loss = state.enabled, state.delay_ms, state.loss_pct
         if not enabled:
             log(f"DROPPED (server off) from {addr[0]}:{addr[1]}")
+            return
+        if loss and random.random() * 100 < loss:
+            log(f"DROPPED (loss {loss}%) from {addr[0]}:{addr[1]}")
             return
         result = answer(state, data)
         if result is None:
@@ -100,6 +106,8 @@ def control_command(state, line):
     with state.lock:
         if cmd == "delay" and len(p) == 2:
             state.delay_ms = int(p[1]); return f"delay={state.delay_ms} ms"
+        if cmd == "loss" and len(p) == 2:           # loss <percent>
+            state.loss_pct = float(p[1]); return f"loss={state.loss_pct}% of queries dropped"
         if cmd in ("stop", "off"):
             state.enabled = False; return "server OFF (dropping queries)"
         if cmd in ("start", "on"):
@@ -117,9 +125,9 @@ def control_command(state, line):
         if cmd == "del" and len(p) == 2:
             state.records.pop(p[1].lower().rstrip("."), None); return "deleted"
         if cmd == "status":
-            return json.dumps({"enabled": state.enabled, "delay_ms": state.delay_ms,
+            return json.dumps({"enabled": state.enabled, "delay_ms": state.delay_ms, "loss_pct": state.loss_pct,
                                "queries": state.queries, "records": state.records})
-    return "error: commands are delay <ms> | stop | start | set <name> <A|AAAA> <ip> [ttl] | ttl <name> <s> | del <name> | status"
+    return "error: commands are delay <ms> | loss <percent> | stop | start | set <name> <A|AAAA> <ip> [ttl] | ttl <name> <s> | del <name> | status"
 
 
 def serve_control(state, port):

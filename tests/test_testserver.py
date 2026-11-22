@@ -46,3 +46,11 @@ def test_runtime_record_change_off_switch_and_delay():
     ts.control_command(st, "delay 200")
     t0 = time.time(); assert ask(port) is not None
     assert time.time() - t0 >= 0.2
+
+
+def test_loss_setting_drops_queries():
+    st, port = start()
+    ts.control_command(st, "loss 100")
+    assert ask(port, timeout=0.4) is None          # everything dropped
+    ts.control_command(st, "loss 0")
+    assert ask(port) is not None                   # back to normal
